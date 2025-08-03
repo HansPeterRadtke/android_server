@@ -7,6 +7,7 @@ import sys
 import os
 import torch
 import numpy as np
+import time
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 PORT = 8888
@@ -97,8 +98,11 @@ async def handle_client(websocket):
           print("[INFO] Full audio data received. Starting transcription...")
           sys.stdout.flush()
           try:
+            model_start = time.time()
             waveform = torch.frombuffer(audio_buffer, dtype=torch.int16).float() / 32768.0
             waveform = waveform.unsqueeze(0)
+
+            prep_start = time.time()
             inputs = processor(
               waveform[0],
               sampling_rate=16000,
@@ -107,11 +111,23 @@ async def handle_client(websocket):
             )
             input_features = inputs.input_features.to(device)
             attention_mask = inputs.get("attention_mask")
+            forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
+            prep_end = time.time()
+
+            gen_start = time.time()
             if attention_mask is not None:
               attention_mask = attention_mask.to(device)
-              predicted_ids = model.generate(input_features, attention_mask=attention_mask)
+              predicted_ids = model.generate(input_features, attention_mask=attention_mask, forced_decoder_ids=forced_decoder_ids)
             else:
-              predicted_ids = model.generate(input_features)
+              predicted_ids = model.generate(input_features, forced_decoder_ids=forced_decoder_ids)
+            gen_end = time.time()
+
+            model_end = time.time()
+            print(f"[INFO] Pre-processing took {prep_end - prep_start:.3f} seconds")
+            print(f"[INFO] Model.generate() took {gen_end - gen_start:.3f} seconds")
+            print(f"[INFO] Total model processing took {model_end - model_start:.3f} seconds")
+            sys.stdout.flush()
+
             result = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
             print("[INFO] Transcription:", result)
             await websocket.send(json.dumps({"transcription": result}))

@@ -74,7 +74,7 @@ async def handle_client(websocket):
 
 
 async def main():
-  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size=2**23):
+  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size = (2**23), reuse_address = True):
     print("[INFO] Server started on port 8888")
     await asyncio.Future()  # run forever
 

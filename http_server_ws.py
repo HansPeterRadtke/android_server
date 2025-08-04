@@ -1,17 +1,22 @@
-import asyncio
-import websockets
+import os
+import time
 import json
 import torch
-import time
-import numpy as np
+import asyncio
 import traceback
+import websockets
+import numpy as np
 from datetime import datetime
+
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE" ] = "1"
+
 print("Importing transformers ...")
 from transformers import pipeline
 print("Importing transformers DONE")
 
 print("creating pipeline ...")
-asr_pipe = pipeline("automatic-speech-recognition", model="../../models/whisper-small")
+asr_pipe = pipeline("automatic-speech-recognition", model = "../../models/Systran/faster-whisper-large-v3")
 print("creating pipeline DONE")
 
 clients = set()

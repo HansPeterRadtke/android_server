@@ -3,10 +3,16 @@ import websockets
 import json
 import torch
 import time
+import numpy as np
+import traceback
 from datetime import datetime
+print("Importing transformers ...")
 from transformers import pipeline
+print("Importing transformers DONE")
 
-asr_pipe = pipeline("automatic-speech-recognition", model="openai/whisper-small", device=0)
+print("creating pipeline ...")
+asr_pipe = pipeline("automatic-speech-recognition", model="../../models/whisper-small")
+print("creating pipeline DONE")
 
 clients = set()
 audio_buffers = {}
@@ -15,22 +21,20 @@ timers = {}
 
 async def transcribe_and_send(websocket, audio_data):
   print("[DEBUG] Starting transcription with", len(audio_data), "bytes")
-  start_pre = time.time()
-  input_values = asr_pipe.feature_extractor(audio_data, sampling_rate=16000, return_tensors="pt").input_values.to(0)
-  end_pre = time.time()
-  print("[DEBUG] Preprocessing took", round((end_pre - start_pre) * 1000), "ms")
+  start = time.time()
 
-  with torch.inference_mode():
-    start_gen = time.time()
-    prediction = asr_pipe.model.generate(input_values, num_beams=1)
-    end_gen = time.time()
+  try:
+    waveform = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    result = asr_pipe(waveform)
+    end = time.time()
 
-  decoded = asr_pipe.tokenizer.batch_decode(prediction, skip_special_tokens=True)[0]
-  end_total = time.time()
-  print("[DEBUG] Model.generate() took", round((end_gen - start_gen) * 1000), "ms")
-  print("[DEBUG] Total model processing took", round((end_total - start_pre) * 1000), "ms")
+    print("[DEBUG] Transcription took", round((end - start) * 1000), "ms")
+    print("[DEBUG] Transcribed text:", result["text"])
+    await websocket.send(json.dumps({"transcription": result["text"]}))
 
-  await websocket.send(json.dumps({"transcription": decoded}))
+  except Exception as e:
+    print("[ERROR] Transcription failed:", e)
+    traceback.print_exc()
 
 
 async def handle_client(websocket):
@@ -74,7 +78,7 @@ async def handle_client(websocket):
 
 
 async def main():
-  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size = (2**23), reuse_address = True):
+  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size=(2**23), reuse_address=True):
     print("[INFO] Server started on port 8888")
     await asyncio.Future()  # run forever
 

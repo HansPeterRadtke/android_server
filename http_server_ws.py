@@ -16,7 +16,7 @@ from transformers import pipeline
 print("Importing transformers DONE")
 
 print("creating pipeline ...")
-asr_pipe = pipeline("automatic-speech-recognition", model = "../../models/Systran/faster-whisper-large-v3")
+asr_pipe = pipeline("automatic-speech-recognition", model = "../../models/whisper-small")
 print("creating pipeline DONE")
 
 clients = set()
@@ -83,9 +83,10 @@ async def handle_client(websocket):
 
 
 async def main():
-  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size=(2**23), reuse_address=True):
+  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size = (2**23), reuse_address = True):
     print("[INFO] Server started on port 8888")
     await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
   asyncio.run(main())
+

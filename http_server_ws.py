@@ -1,92 +1,60 @@
-import os
-import time
-import json
-import torch
 import asyncio
-import traceback
 import websockets
-import numpy as np
-from datetime import datetime
-
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE" ] = "1"
-
-print("Importing transformers ...")
-from transformers import pipeline
-print("Importing transformers DONE")
-
-print("creating pipeline ...")
-asr_pipe = pipeline("automatic-speech-recognition", model = "../../models/whisper-small")
-print("creating pipeline DONE")
+import traceback
+import sys
+import threading
 
 clients = set()
-audio_buffers = {}
-timers = {}
-
-
-async def transcribe_and_send(websocket, audio_data):
-  print("[DEBUG] Starting transcription with", len(audio_data), "bytes")
-  start = time.time()
-
-  try:
-    waveform = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-    result = asr_pipe(waveform)
-    end = time.time()
-
-    print("[DEBUG] Transcription took", round((end - start) * 1000), "ms")
-    print("[DEBUG] Transcribed text:", result["text"])
-    await websocket.send(json.dumps({"transcription": result["text"]}))
-
-  except Exception as e:
-    print("[ERROR] Transcription failed:", e)
-    traceback.print_exc()
-
 
 async def handle_client(websocket):
   print("[INFO] WebSocket Connected")
+  sys.stdout.flush()
   clients.add(websocket)
-  audio_buffers[websocket] = bytearray()
-  timers[websocket] = None
-
-  async def reset_timer():
-    if timers[websocket]:
-      timers[websocket].cancel()
-    timers[websocket] = asyncio.get_event_loop().call_later(1.5, lambda: asyncio.create_task(finish_audio(websocket)))
-
-  async def finish_audio(ws):
-    if audio_buffers[ws]:
-      await transcribe_and_send(ws, bytes(audio_buffers[ws]))
-      audio_buffers[ws].clear()
 
   try:
     async for message in websocket:
-      if isinstance(message, str):
+      print("[DEBUG] Received message of type:", type(message))
+      sys.stdout.flush()
+      if isinstance(message, bytes):
         try:
-          data = json.loads(message)
-          if data.get("audio"):
-            print("[INFO] Started recording.")
-        except:
-          print("[ERROR] Could not parse JSON string.")
-      else:
-        audio_buffers[websocket].extend(message)
-        await reset_timer()
-
-  except websockets.exceptions.ConnectionClosed:
-    print("[INFO] Client disconnected")
+          print("[DEBUG] Echoing audio chunk, length:", len(message))
+          sys.stdout.flush()
+          await websocket.send(message)
+        except Exception as e:
+          print("[ERROR] Failed to echo audio chunk:", e)
+          traceback.print_exc()
+          sys.stdout.flush()
+  except websockets.exceptions.ConnectionClosed as e:
+    print("[INFO] Client disconnected:", e)
+    sys.stdout.flush()
   finally:
-    await finish_audio(websocket)
     clients.discard(websocket)
-    audio_buffers.pop(websocket, None)
-    if timers[websocket]:
-      timers[websocket].cancel()
-    timers.pop(websocket, None)
-
+    print("[DEBUG] Client removed from clients set")
+    sys.stdout.flush()
 
 async def main():
-  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size = (2**23), reuse_address = True):
-    print("[INFO] Server started on port 8888")
-    await asyncio.Future()  # run forever
+  print("[INFO] Server launching on port 8888")
+  sys.stdout.flush()
+  async with websockets.serve(handle_client, "0.0.0.0", 8888, max_size=(2**23), reuse_address=True):
+    print("[INFO] Server started and accepting connections")
+    sys.stdout.flush()
+    await asyncio.Future()
+
+def input_thread():
+  while True:
+    try:
+      cmd = input().strip()
+      if cmd == "exit":
+        print("[INFO] Shutting down server via input thread")
+        sys.stdout.flush()
+        sys.exit(0)
+      else:
+        print(f"[DEBUG] Unknown command: {cmd}")
+        sys.stdout.flush()
+    except Exception as e:
+      print("[ERROR] Input thread error:", e)
+      sys.stdout.flush()
 
 if __name__ == "__main__":
+  threading.Thread(target=input_thread, daemon=True).start()
   asyncio.run(main())
-

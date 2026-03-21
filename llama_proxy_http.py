@@ -228,16 +228,42 @@ async def handle_health(request: web.Request) -> web.StreamResponse:
     app = request.app
     upstream = app["upstream_base_url"]
     session: aiohttp.ClientSession = app["session"]
+    fallback_echo: bool = bool(app["fallback_echo"])
     upstream_url = f"{upstream}/health"
-    return await _proxy_request(session, "GET", upstream_url, timeout_total_s=10.0)
+    resp = await _proxy_request(session, "GET", upstream_url, timeout_total_s=10.0)
+    if fallback_echo and resp.status >= 500:
+        return web.json_response(
+            {
+                "ok": True,
+                "fallback_echo": True,
+                "upstream": upstream,
+                "status": "fallback",
+            }
+        )
+    return resp
 
 
 async def handle_models(request: web.Request) -> web.StreamResponse:
     app = request.app
     upstream = app["upstream_base_url"]
     session: aiohttp.ClientSession = app["session"]
+    fallback_echo: bool = bool(app["fallback_echo"])
     upstream_url = f"{upstream}/v1/models"
-    return await _proxy_request(session, "GET", upstream_url, timeout_total_s=20.0)
+    resp = await _proxy_request(session, "GET", upstream_url, timeout_total_s=20.0)
+    if fallback_echo and resp.status >= 500:
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "echo-fallback",
+                        "object": "model",
+                        "owned_by": "android_server",
+                    }
+                ],
+            }
+        )
+    return resp
 
 
 def _apply_model_override(payload: dict[str, Any], model_override: str | None) -> None:
@@ -253,6 +279,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     model_override: str | None = app["model_override"]
     force_non_streaming: bool = app["force_non_streaming"]
     echo_mode: bool = bool(app["echo_mode"])
+    fallback_echo: bool = bool(app["fallback_echo"])
 
     try:
         payload = await request.json()
@@ -278,6 +305,11 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     resp = await _proxy_request(session, "POST", upstream_url, json_body=payload, timeout_total_s=600.0)
     dt = _now_ms() - t0
     logging.info("POST /v1/chat/completions -> %s in %d ms", resp.status, dt)
+    if fallback_echo and resp.status >= 500:
+        logging.warning("Upstream unavailable, falling back to echo response")
+        if bool(payload.get("stream")):
+            return await _echo_chat_completion_stream(request, payload)
+        return _echo_chat_completion(payload)
     return resp
 
 
@@ -308,12 +340,14 @@ def make_app(
     model_override: str | None,
     force_non_streaming: bool,
     echo_mode: bool,
+    fallback_echo: bool,
 ) -> web.Application:
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["upstream_base_url"] = upstream_base_url.rstrip("/")
     app["model_override"] = model_override
     app["force_non_streaming"] = force_non_streaming
     app["echo_mode"] = echo_mode
+    app["fallback_echo"] = fallback_echo
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
@@ -337,7 +371,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--allow-stream",
         action="store_true",
-        default=(os.environ.get("LLAMA_PROXY_ALLOW_STREAM", "").strip() == "1"),
+        default=(os.environ.get("LLAMA_PROXY_ALLOW_STREAM", "1").strip() != "0"),
         help="Allow stream=true to pass through (proxy still returns raw upstream bytes).",
     )
     p.add_argument(
@@ -350,6 +384,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         default=(os.environ.get("LLAMA_PROXY_ECHO", "").strip() == "1"),
         help="Return the last user message unchanged instead of forwarding upstream.",
+    )
+    p.add_argument(
+        "--fallback-echo",
+        action="store_true",
+        default=(os.environ.get("LLAMA_PROXY_FALLBACK_ECHO", "1").strip() != "0"),
+        help="If upstream is unavailable, return the last user message unchanged.",
     )
     return p.parse_args(argv)
 
@@ -373,6 +413,7 @@ def main(argv: list[str]) -> int:
         model_override=args.model_override,
         force_non_streaming=force_non_streaming,
         echo_mode=bool(args.echo),
+        fallback_echo=bool(args.fallback_echo),
     )
 
     if args.echo:

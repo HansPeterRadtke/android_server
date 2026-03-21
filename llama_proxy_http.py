@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import time
@@ -27,6 +28,98 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
+
+
+def _extract_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return ""
+
+
+def _last_user_text(payload: dict[str, Any]) -> str:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") != "user":
+            continue
+        text = _extract_text_content(message.get("content"))
+        text = re.sub(r"<info-msg>.*?</info-msg>\s*", "", text, flags=re.S).strip()
+        if text.strip():
+            return text.strip()
+    return ""
+
+
+def _echo_chat_completion(payload: dict[str, Any]) -> web.Response:
+    text = _last_user_text(payload)
+    body = {
+        "id": f"chatcmpl-echo-{int(time.time() * 1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": str(payload.get("model") or "echo"),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+    return web.json_response(body)
+
+
+async def _echo_chat_completion_stream(request: web.Request, payload: dict[str, Any]) -> web.StreamResponse:
+    text = _last_user_text(payload)
+    created = int(time.time())
+    model = str(payload.get("model") or "echo")
+    chunk_id = f"chatcmpl-echo-{int(time.time() * 1000)}"
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await resp.prepare(request)
+
+    chunks = [
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}],
+        },
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    for chunk in chunks:
+        await resp.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+    await resp.write(b"data: [DONE]\n\n")
+    await resp.write_eof()
+    return resp
 
 
 @dataclass(frozen=True)
@@ -159,6 +252,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     session: aiohttp.ClientSession = app["session"]
     model_override: str | None = app["model_override"]
     force_non_streaming: bool = app["force_non_streaming"]
+    echo_mode: bool = bool(app["echo_mode"])
 
     try:
         payload = await request.json()
@@ -167,6 +261,11 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
 
     if not isinstance(payload, dict):
         return _json_error("JSON body must be an object", status=400)
+
+    if echo_mode:
+        if bool(payload.get("stream")):
+            return await _echo_chat_completion_stream(request, payload)
+        return _echo_chat_completion(payload)
 
     # Keep Android-side behavior simple: block until reply arrives.
     if force_non_streaming:
@@ -203,11 +302,18 @@ async def on_cleanup(app: web.Application) -> None:
         await session.close()
 
 
-def make_app(*, upstream_base_url: str, model_override: str | None, force_non_streaming: bool) -> web.Application:
+def make_app(
+    *,
+    upstream_base_url: str,
+    model_override: str | None,
+    force_non_streaming: bool,
+    echo_mode: bool,
+) -> web.Application:
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["upstream_base_url"] = upstream_base_url.rstrip("/")
     app["model_override"] = model_override
     app["force_non_streaming"] = force_non_streaming
+    app["echo_mode"] = echo_mode
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
@@ -239,6 +345,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=os.environ.get("LLAMA_PROXY_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    p.add_argument(
+        "--echo",
+        action="store_true",
+        default=(os.environ.get("LLAMA_PROXY_ECHO", "").strip() == "1"),
+        help="Return the last user message unchanged instead of forwarding upstream.",
+    )
     return p.parse_args(argv)
 
 
@@ -256,9 +368,17 @@ def main(argv: list[str]) -> int:
 
     force_non_streaming = not bool(args.allow_stream)
 
-    app = make_app(upstream_base_url=upstream, model_override=args.model_override, force_non_streaming=force_non_streaming)
+    app = make_app(
+        upstream_base_url=upstream,
+        model_override=args.model_override,
+        force_non_streaming=force_non_streaming,
+        echo_mode=bool(args.echo),
+    )
 
-    logging.info("Starting llama proxy on %s:%s -> %s", args.host, args.port, upstream)
+    if args.echo:
+        logging.info("Starting llama proxy in echo mode on %s:%s", args.host, args.port)
+    else:
+        logging.info("Starting llama proxy on %s:%s -> %s", args.host, args.port, upstream)
     web.run_app(app, host=args.host, port=args.port)
     return 0
 
